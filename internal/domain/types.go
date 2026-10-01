@@ -143,18 +143,20 @@ type AuditEvent struct {
 }
 
 type State struct {
-	SchemaVersion         int                          `json:"schema_version"`
-	Revision              uint64                       `json:"revision"`
-	Plans                 map[string]RolloutPlan       `json:"plans"`
-	Revisions             map[string]ZoneRevision      `json:"revisions"`
-	Nodes                 map[string]ResolverNode      `json:"nodes"`
-	Leases                map[string]NodeLease         `json:"leases"`
-	LeaseGroups           map[string]LeaseGroup        `json:"lease_groups"`
-	Probes                map[string]Probe             `json:"probes"`
-	Assessments           map[string]RolloutAssessment `json:"assessments"`
-	LeaseRequestKeys      map[string]string            `json:"lease_request_keys"`
-	AssessmentRequestKeys map[string]string            `json:"assessment_request_keys"`
-	AuditEvents           []AuditEvent                 `json:"audit_events"`
+	SchemaVersion         int                           `json:"schema_version"`
+	Revision              uint64                        `json:"revision"`
+	Plans                 map[string]RolloutPlan        `json:"plans"`
+	Revisions             map[string]ZoneRevision       `json:"revisions"`
+	Nodes                 map[string]ResolverNode       `json:"nodes"`
+	Leases                map[string]NodeLease          `json:"leases"`
+	LeaseGroups           map[string]LeaseGroup         `json:"lease_groups"`
+	Probes                map[string]Probe              `json:"probes"`
+	Assessments           map[string]RolloutAssessment  `json:"assessments"`
+	FreezePolicies        map[string]FreezePolicy       `json:"freeze_policies"`
+	FreezeInterceptions   map[string]FreezeInterception `json:"freeze_interceptions"`
+	LeaseRequestKeys      map[string]string             `json:"lease_request_keys"`
+	AssessmentRequestKeys map[string]string             `json:"assessment_request_keys"`
+	AuditEvents           []AuditEvent                  `json:"audit_events"`
 }
 
 type PageMeta struct {
@@ -170,4 +172,14 @@ type PlanPage struct {
 type NodePage struct {
 	Items []ResolverNode `json:"items"`
 	Meta  PageMeta       `json:"meta"`
+}
+
+type FreezePolicyPage struct {
+	Items []FreezePolicy `json:"items"`
+	Meta  PageMeta       `json:"meta"`
+}
+
+type FreezeInterceptionPage struct {
+	Items []FreezeInterception `json:"items"`
+	Meta  PageMeta             `json:"meta"`
 }

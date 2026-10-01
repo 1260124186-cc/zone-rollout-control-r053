@@ -2,6 +2,7 @@ package allocation
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -11,20 +12,42 @@ import (
 	"solo-0014-zone-rollout-control/internal/store"
 )
 
-type Service struct {
-	store *store.Store
-	clock platform.Clock
-	ids   platform.IDGenerator
+// InterceptionRecorder persists freeze interception records. It is satisfied
+// by the freeze service and injected so blocked attempts stay auditable.
+type InterceptionRecorder interface {
+	RecordInterception(
+		ctx context.Context,
+		policy domain.FreezePolicy,
+		operation domain.FreezeOperation,
+		planID string,
+		targetZone string,
+		actorRole string,
+	) (domain.FreezeInterception, error)
 }
 
-func New(stateStore *store.Store, clock platform.Clock, ids platform.IDGenerator) *Service {
-	return &Service{store: stateStore, clock: clock, ids: ids}
+var errFreezeBlocked = errors.New("freeze policy blocks this change")
+
+type Service struct {
+	store   *store.Store
+	clock   platform.Clock
+	ids     platform.IDGenerator
+	freezes InterceptionRecorder
+}
+
+func New(
+	stateStore *store.Store,
+	clock platform.Clock,
+	ids platform.IDGenerator,
+	freezes InterceptionRecorder,
+) *Service {
+	return &Service{store: stateStore, clock: clock, ids: ids, freezes: freezes}
 }
 
 func (s *Service) Allocate(
 	ctx context.Context,
 	planID string,
 	input domain.LeaseInput,
+	actorRole string,
 ) (domain.LeaseGroup, error) {
 	if err := domain.ValidateLeaseInput(input); err != nil {
 		return domain.LeaseGroup{}, err
@@ -34,6 +57,8 @@ func (s *Service) Allocate(
 	fingerprint := domain.LeaseFingerprint(planID, input)
 	now := s.clock.Now().UTC()
 	var group domain.LeaseGroup
+	var blocked domain.FreezePolicy
+	blockedZone := ""
 
 	err := s.store.Write(ctx, func(state *domain.State) error {
 		plan, ok := state.Plans[planID]
@@ -58,8 +83,15 @@ func (s *Service) Allocate(
 					"request_key": input.RequestKey,
 				})
 			}
+			// A recorded allocation replays even under a freeze: the group was
+			// created while the change was legal, and replay adds nothing new.
 			group = existing
 			return nil
+		}
+		if policy, hit := domain.BlockingFreeze(state, plan.Zone, domain.FreezeOpAllocation, actorRole, now); hit {
+			blocked = policy
+			blockedZone = plan.Zone
+			return errFreezeBlocked
 		}
 
 		expireLeases(state, now)
@@ -126,7 +158,26 @@ func (s *Service) Allocate(
 		})
 		return nil
 	})
+	if blockedZone != "" {
+		return domain.LeaseGroup{}, s.freezeBlock(ctx, blocked, planID, blockedZone, actorRole)
+	}
 	return group, err
+}
+
+// freezeBlock records the interception in its own transaction and returns the
+// shared freeze explanation. The record is best-effort: the block decision is
+// already final, so a recording failure never changes the answer.
+func (s *Service) freezeBlock(
+	ctx context.Context,
+	policy domain.FreezePolicy,
+	planID string,
+	targetZone string,
+	actorRole string,
+) error {
+	if s.freezes != nil {
+		_, _ = s.freezes.RecordInterception(ctx, policy, domain.FreezeOpAllocation, planID, targetZone, actorRole)
+	}
+	return domain.FreezeBlockedError(policy, domain.FreezeOpAllocation, targetZone)
 }
 
 func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease, error) {

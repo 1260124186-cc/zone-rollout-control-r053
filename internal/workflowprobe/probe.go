@@ -20,6 +20,8 @@ func Run(args []string, output io.Writer) error {
 		run = runProbeIngestion
 	case "consistency-assessment":
 		run = runConsistencyAssessment
+	case "zone-freeze-enforcement":
+		run = runZoneFreezeEnforcement
 	default:
 		return fmt.Errorf("unsupported workflow %q", args[0])
 	}

@@ -82,6 +82,28 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `probe_count`、`success_count`、`success_ratio`、`maximum_latency_ms`。
 - `created_at`。
 
+### FreezePolicy
+
+一条区域变更冻结策略，在重大活动期间阻止误操作。
+
+- `id`：服务生成的稳定标识。
+- `zone`：冻结的区域名称，或 `*` 表示全部区域。
+- `scope`：`all`、`revision`、`activation` 或 `allocation`，决定覆盖哪些入口。
+- `reason`：冻结原因，随拦截解释一同返回。
+- `exception_roles`：允许绕过冻结的角色列表，调用方通过 `X-Actor-Role` 请求头声明。
+- `starts_at`、`ends_at`：半开 UTC 时间窗口 `[starts_at, ends_at)`，到达 `ends_at` 即失效。
+- `version`：每次变更递增，更新和撤销需要匹配版本。
+- `revoked_at`：撤销时间；撤销后策略不再拦截，但已记录的拦截保留。
+
+### FreezeInterception
+
+一次被冻结策略拦截的变更尝试的不可变记录。
+
+- `id`、`policy_id`、`zone`（被尝试的目标区域）、`operation`、`plan_id`。
+- `actor_role`：调用方声明的角色（如有）。
+- `reason`、`message`：与返回给调用方的解释一致。
+- `at`：拦截时间。
+
 ## 4. 状态和规则
 
 ### 滚动计划状态
@@ -141,6 +163,17 @@ ready --lease--> leased --report--> ready
 - `serial_mismatch`
 - `success_ratio_below_minimum`
 - `latency_limit_exceeded`
+
+### 区域变更冻结
+
+- 冻结策略按区域（或 `*`）、范围和时间窗口登记，窗口为半开区间 `[starts_at, ends_at)`，全部按 UTC 时刻比较，客户端可用任意时区偏移书写。
+- 被覆盖的入口只有三个：追加区域版本（`revision_append`）、激活计划（`activation`）、分配租约（`allocation`）。三个入口返回同一条解释文本，错误码为 `zone_frozen`。
+- 冻结生效前已经开始的合法流程继续：已领取租约可正常提交探针、释放和过期；已记录的分配请求同键同内容重放仍返回原分配组；已激活计划可正常完成；探针登记和一致性判定不被拦截。
+- 调用方在 `X-Actor-Role` 请求头中声明角色；只有全部匹配中的生效策略都把该角色列入例外时才放行（重叠冻结取最严）。
+- 多条策略同时匹配时，按 `(starts_at, id)` 确定性选择用于解释的策略。
+- 策略更新和撤销需要匹配当前版本；已撤销策略不能再更新，重复撤销返回冲突。
+- 每次拦截都写入独立的不可变拦截记录；策略失效或撤销不会删除已有记录。
+- 未配置策略的区域行为完全不变。
 
 ## 5. 工作流
 
@@ -212,6 +245,28 @@ ready --lease--> leased --report--> ready
 
 失败行为：缺少区域版本、没有探针、请求键冲突或保存失败不会更新计划摘要。
 
+### W5 区域变更冻结
+
+入口：
+
+- `PUT /v1/freeze-policies`
+- `GET /v1/freeze-policies`
+- `GET /v1/freeze-policies/{id}`
+- `PATCH /v1/freeze-policies/{id}`
+- `PATCH /v1/freeze-policies/{id}/revoke`
+- `GET /v1/freeze-interceptions`
+
+步骤：
+
+1. HTTP 层严格解码 JSON，校验区域、范围、角色和时间窗口。
+2. 冻结服务在锁内登记、更新或撤销策略，版本冲突拒绝变更。
+3. 计划与分配服务在各自写事务内评估生效策略，命中即拒绝并返回统一解释。
+4. 拦截记录在独立事务中落库，与被拒的变更互不影响。
+
+成功行为：生效窗口内被覆盖的入口返回 `zone_frozen` 和同一解释；例外角色放行；窗口结束或撤销后入口恢复。
+
+失败行为：非法窗口、非法角色、版本冲突或重复撤销不会修改状态。
+
 ## 6. 模块边界
 
 | 模块 | 路径 | 责任 |
@@ -223,6 +278,7 @@ ready --lease--> leased --report--> ready
 | allocation | `internal/allocation` | 节点筛选、幂等分配组和租约生命周期 |
 | probe | `internal/probe` | 探针校验、幂等写入和租约完成 |
 | assessment | `internal/assessment` | 探针聚合和一致性判定 |
+| freeze | `internal/freeze` | 冻结策略登记、撤销和拦截记录 |
 | domain | `internal/domain` | 聚合、值校验、状态迁移和纯计算 |
 | store | `internal/store` | 锁内副本事务和原子 JSON 持久化 |
 | platform | `internal/platform` | 时钟、标识、游标和文件锁 |
@@ -260,6 +316,12 @@ ready --lease--> leased --report--> ready
 - `PATCH /v1/leases/{id}/probes`
 - `PATCH /v1/plans/{id}/assessments`
 - `GET /v1/plans/{id}/assessments/latest`
+- `PUT /v1/freeze-policies`
+- `GET /v1/freeze-policies`
+- `GET /v1/freeze-policies/{id}`
+- `PATCH /v1/freeze-policies/{id}`
+- `PATCH /v1/freeze-policies/{id}/revoke`
+- `GET /v1/freeze-interceptions`
 
 ## 8. 工程机制
 
@@ -282,5 +344,6 @@ ready --lease--> leased --report--> ready
 2. 节点分配、租约唯一性、幂等重放和无可用节点冲突。
 3. 探针首写、同键重放、同键异载荷冲突和释放冲突。
 4. 一致性通过、审核触发、最新结果查询和幂等重放。
+5. 冻结登记、三入口同一解释、例外角色、在途流程放行、重叠与撤销、跨时区窗口和并发稳定。
 
 每条探针使用独立临时目录，不访问外部网络，结束后关闭服务。

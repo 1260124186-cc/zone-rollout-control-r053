@@ -12,7 +12,7 @@ func (s *Server) allocateLeases(w http.ResponseWriter, r *http.Request) {
 		sendError(w, r, err)
 		return
 	}
-	group, err := s.allocations.Allocate(r.Context(), r.PathValue("id"), input)
+	group, err := s.allocations.Allocate(r.Context(), r.PathValue("id"), input, actorRole(r))
 	if err != nil {
 		sendError(w, r, err)
 		return

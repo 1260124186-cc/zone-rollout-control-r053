@@ -39,6 +39,11 @@
       "responsibility": "probe aggregation, deterministic verdicts, and latest result reads"
     },
     {
+      "id": "freeze",
+      "path": "internal/freeze",
+      "responsibility": "zone change freeze policies, revocation, and interception records"
+    },
+    {
       "id": "domain",
       "path": "internal/domain",
       "responsibility": "entities, DNS value validation, transitions, and stable errors"
@@ -151,6 +156,28 @@
         "httpapi",
         "assessment",
         "probe",
+        "domain",
+        "storage"
+      ]
+    },
+    {
+      "id": "zone-freeze-enforcement",
+      "name": "Zone change freeze enforcement",
+      "entry": "PUT /v1/freeze-policies -> guarded revision, activation, and allocation entries",
+      "steps": [
+        "register a freeze policy with zone, scope, reason, exception roles, and a UTC window",
+        "reject revision append, activation, and allocation with one identical explanation",
+        "let in-flight leases, recorded allocation replays, and plan completion continue",
+        "record every interception immutably and keep it after expiry or revocation"
+      ],
+      "success": "covered entries return zone_frozen with the same explanation while exception roles and grandfathered flows proceed",
+      "failure": "invalid windows, stale policy versions, and repeated revocations fail without state changes",
+      "verification": "workflowprobe zone-freeze-enforcement covers registration, identical explanations, exceptions, grandfathering, overlap, revocation, expiry, timezone offsets, and concurrency",
+      "module_ids": [
+        "httpapi",
+        "freeze",
+        "plan",
+        "allocation",
         "domain",
         "storage"
       ]

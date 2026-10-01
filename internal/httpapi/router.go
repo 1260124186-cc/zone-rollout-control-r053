@@ -21,4 +21,11 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("PATCH /v1/plans/{id}/assessments", s.assessPlan)
 	mux.HandleFunc("GET /v1/plans/{id}/assessments/latest", s.latestAssessment)
+
+	mux.HandleFunc("PUT /v1/freeze-policies", s.createFreezePolicy)
+	mux.HandleFunc("GET /v1/freeze-policies", s.listFreezePolicies)
+	mux.HandleFunc("GET /v1/freeze-policies/{id}", s.getFreezePolicy)
+	mux.HandleFunc("PATCH /v1/freeze-policies/{id}", s.updateFreezePolicy)
+	mux.HandleFunc("PATCH /v1/freeze-policies/{id}/revoke", s.revokeFreezePolicy)
+	mux.HandleFunc("GET /v1/freeze-interceptions", s.listFreezeInterceptions)
 }

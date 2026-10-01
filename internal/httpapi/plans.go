@@ -64,7 +64,7 @@ func (s *Server) addRevision(w http.ResponseWriter, r *http.Request) {
 		sendError(w, r, err)
 		return
 	}
-	result, err := s.plans.AddRevision(r.Context(), r.PathValue("id"), input)
+	result, err := s.plans.AddRevision(r.Context(), r.PathValue("id"), input, actorRole(r))
 	if err != nil {
 		sendError(w, r, err)
 		return
@@ -82,7 +82,7 @@ func (s *Server) activatePlan(w http.ResponseWriter, r *http.Request) {
 		sendError(w, r, domain.Validation("expected_version must be greater than zero", nil))
 		return
 	}
-	result, err := s.plans.Activate(r.Context(), r.PathValue("id"), input.ExpectedVersion)
+	result, err := s.plans.Activate(r.Context(), r.PathValue("id"), input.ExpectedVersion, actorRole(r))
 	if err != nil {
 		sendError(w, r, err)
 		return

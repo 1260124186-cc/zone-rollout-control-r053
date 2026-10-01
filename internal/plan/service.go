@@ -3,6 +3,7 @@ package plan
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 
@@ -11,14 +12,35 @@ import (
 	"solo-0014-zone-rollout-control/internal/store"
 )
 
-type Service struct {
-	store *store.Store
-	clock platform.Clock
-	ids   platform.IDGenerator
+// InterceptionRecorder persists freeze interception records. It is satisfied
+// by the freeze service and injected so blocked attempts stay auditable.
+type InterceptionRecorder interface {
+	RecordInterception(
+		ctx context.Context,
+		policy domain.FreezePolicy,
+		operation domain.FreezeOperation,
+		planID string,
+		targetZone string,
+		actorRole string,
+	) (domain.FreezeInterception, error)
 }
 
-func New(stateStore *store.Store, clock platform.Clock, ids platform.IDGenerator) *Service {
-	return &Service{store: stateStore, clock: clock, ids: ids}
+var errFreezeBlocked = errors.New("freeze policy blocks this change")
+
+type Service struct {
+	store   *store.Store
+	clock   platform.Clock
+	ids     platform.IDGenerator
+	freezes InterceptionRecorder
+}
+
+func New(
+	stateStore *store.Store,
+	clock platform.Clock,
+	ids platform.IDGenerator,
+	freezes InterceptionRecorder,
+) *Service {
+	return &Service{store: stateStore, clock: clock, ids: ids, freezes: freezes}
 }
 
 func (s *Service) Create(ctx context.Context, input domain.PlanCreateInput) (domain.RolloutPlan, error) {
@@ -51,6 +73,7 @@ func (s *Service) AddRevision(
 	ctx context.Context,
 	planID string,
 	input domain.RevisionCreateInput,
+	actorRole string,
 ) (domain.ZoneRevision, error) {
 	normalized, err := domain.NormalizeRevisionInput(input)
 	if err != nil {
@@ -61,6 +84,8 @@ func (s *Service) AddRevision(
 	}
 	now := s.clock.Now().UTC()
 	var created domain.ZoneRevision
+	var blocked domain.FreezePolicy
+	blockedZone := ""
 	err = s.store.Write(ctx, func(state *domain.State) error {
 		plan, ok := state.Plans[planID]
 		if !ok {
@@ -71,6 +96,11 @@ func (s *Service) AddRevision(
 				"plan_id": planID,
 				"state":   plan.State,
 			})
+		}
+		if policy, hit := domain.BlockingFreeze(state, plan.Zone, domain.FreezeOpRevisionAppend, actorRole, now); hit {
+			blocked = policy
+			blockedZone = plan.Zone
+			return errFreezeBlocked
 		}
 		for _, revision := range state.Revisions {
 			if revision.PlanID != planID {
@@ -108,6 +138,9 @@ func (s *Service) AddRevision(
 		})
 		return nil
 	})
+	if blockedZone != "" {
+		return domain.ZoneRevision{}, s.freezeBlock(ctx, blocked, domain.FreezeOpRevisionAppend, planID, blockedZone, actorRole)
+	}
 	return created, err
 }
 
@@ -115,8 +148,11 @@ func (s *Service) Activate(
 	ctx context.Context,
 	planID string,
 	expectedVersion uint64,
+	actorRole string,
 ) (domain.RolloutPlan, error) {
 	var plan domain.RolloutPlan
+	var blocked domain.FreezePolicy
+	blockedZone := ""
 	err := s.store.Write(ctx, func(state *domain.State) error {
 		current, ok := state.Plans[planID]
 		if !ok {
@@ -126,6 +162,11 @@ func (s *Service) Activate(
 			return versionConflict(planID, expectedVersion, current.Version)
 		}
 		now := s.clock.Now().UTC()
+		if policy, hit := domain.BlockingFreeze(state, current.Zone, domain.FreezeOpActivation, actorRole, now); hit {
+			blocked = policy
+			blockedZone = current.Zone
+			return errFreezeBlocked
+		}
 		if err := domain.ActivatePlan(&current, now); err != nil {
 			return err
 		}
@@ -136,7 +177,27 @@ func (s *Service) Activate(
 		plan = current
 		return nil
 	})
+	if blockedZone != "" {
+		return domain.RolloutPlan{}, s.freezeBlock(ctx, blocked, domain.FreezeOpActivation, planID, blockedZone, actorRole)
+	}
 	return plan, err
+}
+
+// freezeBlock records the interception in its own transaction and returns the
+// shared freeze explanation. The record is best-effort: the block decision is
+// already final, so a recording failure never changes the answer.
+func (s *Service) freezeBlock(
+	ctx context.Context,
+	policy domain.FreezePolicy,
+	operation domain.FreezeOperation,
+	planID string,
+	targetZone string,
+	actorRole string,
+) error {
+	if s.freezes != nil {
+		_, _ = s.freezes.RecordInterception(ctx, policy, operation, planID, targetZone, actorRole)
+	}
+	return domain.FreezeBlockedError(policy, operation, targetZone)
 }
 
 func (s *Service) Complete(

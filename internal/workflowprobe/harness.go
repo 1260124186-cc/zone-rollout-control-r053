@@ -15,6 +15,7 @@ import (
 	"solo-0014-zone-rollout-control/internal/allocation"
 	"solo-0014-zone-rollout-control/internal/assessment"
 	"solo-0014-zone-rollout-control/internal/fleet"
+	"solo-0014-zone-rollout-control/internal/freeze"
 	"solo-0014-zone-rollout-control/internal/httpapi"
 	"solo-0014-zone-rollout-control/internal/plan"
 	"solo-0014-zone-rollout-control/internal/platform"
@@ -44,12 +45,13 @@ func newHarness() (*harness, error) {
 	clock := platform.NewManualClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
 	ids := platform.CryptoIDGenerator{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	plans := plan.New(stateStore, clock, ids)
+	freezes := freeze.New(stateStore, clock, ids)
+	plans := plan.New(stateStore, clock, ids, freezes)
 	nodes := fleet.New(stateStore, clock, ids)
-	allocations := allocation.New(stateStore, clock, ids)
+	allocations := allocation.New(stateStore, clock, ids, freezes)
 	probes := probe.New(stateStore, clock, ids, allocations)
 	assessments := assessment.New(stateStore, clock, ids)
-	api := httpapi.New(plans, nodes, allocations, probes, assessments, ids, logger)
+	api := httpapi.New(plans, nodes, allocations, probes, assessments, freezes, ids, logger)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -79,6 +81,16 @@ func (h *harness) close() {
 }
 
 func (h *harness) call(method string, path string, requestBody any, target any) error {
+	return h.callWithHeaders(method, path, requestBody, target, nil)
+}
+
+func (h *harness) callWithHeaders(
+	method string,
+	path string,
+	requestBody any,
+	target any,
+	headers map[string]string,
+) error {
 	var payload []byte
 	var err error
 	if requestBody != nil {
@@ -93,6 +105,9 @@ func (h *harness) call(method string, path string, requestBody any, target any) 
 	}
 	if requestBody != nil {
 		request.Header.Set("Content-Type", "application/json")
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
 	}
 	response, err := h.client.Do(request)
 	if err != nil {

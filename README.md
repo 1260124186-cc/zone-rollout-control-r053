@@ -45,6 +45,7 @@ internal/fleet              解析节点档案服务
 internal/allocation         节点选择和租约生命周期
 internal/probe              探针登记、幂等重放和租约完成
 internal/assessment         一致性聚合和最新结果查询
+internal/freeze             区域变更冻结策略和拦截记录
 internal/httpapi            HTTP 路由、中间件和响应映射
 internal/workflowprobe      真实 HTTP 路径验证
 ```
@@ -135,6 +136,39 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
   -d '{"request_key": "assess-request-0001"}'
 ```
 
+## 区域变更冻结
+
+重大活动期间可以登记冻结策略，让系统代替人工约定阻止误操作。策略按区域（或 `*` 表示全部区域）、范围和时间窗口生效：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8090/v1/freeze-policies \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zone": "edge.example",
+    "scope": "all",
+    "reason": "National day ceremony traffic protection",
+    "exception_roles": ["release_manager"],
+    "starts_at": "2026-10-01T09:00:00+08:00",
+    "ends_at": "2026-10-02T09:00:00+08:00"
+  }'
+```
+
+- `scope` 取 `all`、`revision`、`activation` 或 `allocation`，决定覆盖哪些入口。
+- 时间窗口为半开区间 `[starts_at, ends_at)`，按 UTC 时刻比较，可用任意时区偏移书写；到达 `ends_at` 即自动失效。
+- 生效期间，追加区域版本、激活计划和分配租约三个入口返回同一条解释，错误码为 `zone_frozen`（HTTP 409）。
+- 调用方通过 `X-Actor-Role` 请求头声明角色；只有全部匹配中的生效策略都例外该角色时才放行（重叠冻结取最严）。
+- 更新策略用 `PATCH /v1/freeze-policies/{id}`，撤销用 `PATCH /v1/freeze-policies/{id}/revoke`，两者都需要 `expected_version` 匹配当前版本。
+- 每次拦截都会留下不可变记录，通过 `GET /v1/freeze-interceptions`（支持 `zone`、`policy_id` 过滤和分页）查询；策略失效或撤销不会抹除已有记录。
+
+冻结生效前已经开始的合法流程按以下规则继续：
+
+1. 已领取的租约可正常提交探针、释放和过期，节点不会被冻结卡住。
+2. 已记录的分配请求用相同请求键和内容重放时仍返回原分配组。
+3. 已激活的计划可正常完成；探针登记和一致性判定不被拦截。
+4. 被拦截的请求不留下任何幂等记录，解冻或撤销后用相同参数重试即可。
+
+未配置策略的区域行为完全不变。
+
 ## API 概览
 
 成功响应：
@@ -178,6 +212,12 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 | `PATCH` | `/v1/leases/{id}/probes` | 登记探针并完成租约 |
 | `PATCH` | `/v1/plans/{id}/assessments` | 创建一致性判定 |
 | `GET` | `/v1/plans/{id}/assessments/latest` | 查询最近判定 |
+| `PUT` | `/v1/freeze-policies` | 登记区域变更冻结策略 |
+| `GET` | `/v1/freeze-policies` | 按区域和生效状态分页查询策略 |
+| `GET` | `/v1/freeze-policies/{id}` | 查询单条策略 |
+| `PATCH` | `/v1/freeze-policies/{id}` | 更新策略（乐观并发） |
+| `PATCH` | `/v1/freeze-policies/{id}/revoke` | 撤销策略 |
+| `GET` | `/v1/freeze-interceptions` | 查询拦截记录 |
 
 ## 状态及失败行为
 
@@ -216,6 +256,7 @@ go run ./cmd/workflowprobe plan-revision-lifecycle
 go run ./cmd/workflowprobe node-lease-allocation
 go run ./cmd/workflowprobe probe-ingestion
 go run ./cmd/workflowprobe consistency-assessment
+go run ./cmd/workflowprobe zone-freeze-enforcement
 ```
 
 探针不访问外部网络，也不依赖已有状态文件。

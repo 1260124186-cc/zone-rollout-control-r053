@@ -18,6 +18,7 @@ const (
 	CodeLeaseExpired        ErrorCode = "lease_expired"
 	CodeLeaseNotClaimed     ErrorCode = "lease_not_claimed"
 	CodeNoProbes            ErrorCode = "no_probes"
+	CodeZoneFrozen          ErrorCode = "zone_frozen"
 	CodeConflict            ErrorCode = "conflict"
 	CodeStorageFailure      ErrorCode = "storage_failure"
 	CodeInternal            ErrorCode = "internal_error"
