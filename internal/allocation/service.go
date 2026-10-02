@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"solo-0014-zone-rollout-control/internal/domain"
+	"solo-0014-zone-rollout-control/internal/freeze"
 	"solo-0014-zone-rollout-control/internal/platform"
 	"solo-0014-zone-rollout-control/internal/store"
 )
@@ -15,15 +16,17 @@ type Service struct {
 	store *store.Store
 	clock platform.Clock
 	ids   platform.IDGenerator
+	guard *freeze.Guard
 }
 
-func New(stateStore *store.Store, clock platform.Clock, ids platform.IDGenerator) *Service {
-	return &Service{store: stateStore, clock: clock, ids: ids}
+func New(stateStore *store.Store, clock platform.Clock, ids platform.IDGenerator, guard *freeze.Guard) *Service {
+	return &Service{store: stateStore, clock: clock, ids: ids, guard: guard}
 }
 
 func (s *Service) Allocate(
 	ctx context.Context,
 	planID string,
+	actorRoles []string,
 	input domain.LeaseInput,
 ) (domain.LeaseGroup, error) {
 	if err := domain.ValidateLeaseInput(input); err != nil {
@@ -34,6 +37,7 @@ func (s *Service) Allocate(
 	fingerprint := domain.LeaseFingerprint(planID, input)
 	now := s.clock.Now().UTC()
 	var group domain.LeaseGroup
+	var frozen *domain.DomainError
 
 	err := s.store.Write(ctx, func(state *domain.State) error {
 		plan, ok := state.Plans[planID]
@@ -59,6 +63,19 @@ func (s *Service) Allocate(
 				})
 			}
 			group = existing
+			return nil
+		}
+
+		// Grandfather rule: a rollout that was already live before the
+		// freeze window may keep allocating nodes so in-flight rollouts
+		// finish. Plans activated during or after the freeze are blocked.
+		// Idempotent replays above bypass the gate, as they are not new
+		// allocations.
+		frozen = s.guard.Check(state, plan.Zone, domain.FreezeScopeAllocation, planID, actorRoles,
+			func(startsAt time.Time) bool {
+				return plan.ActivatedAt != nil && plan.ActivatedAt.UTC().Before(startsAt)
+			})
+		if frozen != nil {
 			return nil
 		}
 
@@ -126,7 +143,13 @@ func (s *Service) Allocate(
 		})
 		return nil
 	})
-	return group, err
+	if err != nil {
+		return domain.LeaseGroup{}, err
+	}
+	if frozen != nil {
+		return domain.LeaseGroup{}, frozen
+	}
+	return group, nil
 }
 
 func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease, error) {

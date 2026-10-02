@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
+	"time"
 
 	"solo-0014-zone-rollout-control/internal/domain"
+	"solo-0014-zone-rollout-control/internal/freeze"
 	"solo-0014-zone-rollout-control/internal/platform"
 	"solo-0014-zone-rollout-control/internal/store"
 )
@@ -15,10 +17,11 @@ type Service struct {
 	store *store.Store
 	clock platform.Clock
 	ids   platform.IDGenerator
+	guard *freeze.Guard
 }
 
-func New(stateStore *store.Store, clock platform.Clock, ids platform.IDGenerator) *Service {
-	return &Service{store: stateStore, clock: clock, ids: ids}
+func New(stateStore *store.Store, clock platform.Clock, ids platform.IDGenerator, guard *freeze.Guard) *Service {
+	return &Service{store: stateStore, clock: clock, ids: ids, guard: guard}
 }
 
 func (s *Service) Create(ctx context.Context, input domain.PlanCreateInput) (domain.RolloutPlan, error) {
@@ -50,6 +53,7 @@ func (s *Service) Create(ctx context.Context, input domain.PlanCreateInput) (dom
 func (s *Service) AddRevision(
 	ctx context.Context,
 	planID string,
+	actorRoles []string,
 	input domain.RevisionCreateInput,
 ) (domain.ZoneRevision, error) {
 	normalized, err := domain.NormalizeRevisionInput(input)
@@ -61,6 +65,7 @@ func (s *Service) AddRevision(
 	}
 	now := s.clock.Now().UTC()
 	var created domain.ZoneRevision
+	var frozen *domain.DomainError
 	err = s.store.Write(ctx, func(state *domain.State) error {
 		plan, ok := state.Plans[planID]
 		if !ok {
@@ -71,6 +76,16 @@ func (s *Service) AddRevision(
 				"plan_id": planID,
 				"state":   plan.State,
 			})
+		}
+		// Grandfather rule: drafting work that legally began before the
+		// freeze window may keep appending revisions. A plan created at
+		// or after the freeze start is fully frozen.
+		frozen = s.guard.Check(state, plan.Zone, domain.FreezeScopeRevision, planID, actorRoles,
+			func(startsAt time.Time) bool {
+				return plan.CreatedAt.UTC().Before(startsAt)
+			})
+		if frozen != nil {
+			return nil
 		}
 		for _, revision := range state.Revisions {
 			if revision.PlanID != planID {
@@ -108,15 +123,23 @@ func (s *Service) AddRevision(
 		})
 		return nil
 	})
-	return created, err
+	if err != nil {
+		return domain.ZoneRevision{}, err
+	}
+	if frozen != nil {
+		return domain.ZoneRevision{}, frozen
+	}
+	return created, nil
 }
 
 func (s *Service) Activate(
 	ctx context.Context,
 	planID string,
 	expectedVersion uint64,
+	actorRoles []string,
 ) (domain.RolloutPlan, error) {
 	var plan domain.RolloutPlan
+	var frozen *domain.DomainError
 	err := s.store.Write(ctx, func(state *domain.State) error {
 		current, ok := state.Plans[planID]
 		if !ok {
@@ -124,6 +147,13 @@ func (s *Service) Activate(
 		}
 		if current.Version != expectedVersion {
 			return versionConflict(planID, expectedVersion, current.Version)
+		}
+		// Activation is the point at which a rollout starts touching the
+		// live zone, so it is never grandfathered: no plan may activate
+		// while a matching freeze is effective, regardless of age.
+		frozen = s.guard.Check(state, current.Zone, domain.FreezeScopeActivation, planID, actorRoles, nil)
+		if frozen != nil {
+			return nil
 		}
 		now := s.clock.Now().UTC()
 		if err := domain.ActivatePlan(&current, now); err != nil {
@@ -136,7 +166,13 @@ func (s *Service) Activate(
 		plan = current
 		return nil
 	})
-	return plan, err
+	if err != nil {
+		return domain.RolloutPlan{}, err
+	}
+	if frozen != nil {
+		return domain.RolloutPlan{}, frozen
+	}
+	return plan, nil
 }
 
 func (s *Service) Complete(

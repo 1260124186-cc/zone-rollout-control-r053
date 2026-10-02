@@ -45,6 +45,7 @@ internal/fleet              解析节点档案服务
 internal/allocation         节点选择和租约生命周期
 internal/probe              探针登记、幂等重放和租约完成
 internal/assessment         一致性聚合和最新结果查询
+internal/freeze             区域变更冻结登记、撤销和拦截守卫
 internal/httpapi            HTTP 路由、中间件和响应映射
 internal/workflowprobe      真实 HTTP 路径验证
 ```
@@ -135,6 +136,26 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
   -d '{"request_key": "assess-request-0001"}'
 ```
 
+登记区域变更冻结：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8090/v1/freezes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zone": "edge.example",
+    "scopes": ["revision", "activation", "allocation"],
+    "starts_at": "2026-10-01T00:00:00Z",
+    "ends_at": "2026-10-02T00:00:00Z",
+    "reason": "national event window",
+    "allowed_roles": ["emergency-admin"],
+    "created_by": "ops-lead"
+  }'
+```
+
+`zone` 留空表示对所有区域生效的全局冻结；`ends_at` 可省略表示无结束时间。冻结生效后，追加修订、激活和分配三个入口在命中时统一返回 HTTP `423` 和 `change_frozen` 错误码，错误详情保持同一结构。请求头 `X-Operator-Roles: emergency-admin` 可按策略配置穿透冻结。
+
+冻结前已合法开始的流程按明确规则处理：冻结开始前创建的草稿可继续追加修订，冻结开始前已激活的计划可继续分配节点，激活入口任何时候都不豁免。撤销冻结只对未来生效，已发生的拦截记录仍可通过 `GET /v1/freeze-blocks` 查询。
+
 ## API 概览
 
 成功响应：
@@ -178,6 +199,12 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 | `PATCH` | `/v1/leases/{id}/probes` | 登记探针并完成租约 |
 | `PATCH` | `/v1/plans/{id}/assessments` | 创建一致性判定 |
 | `GET` | `/v1/plans/{id}/assessments/latest` | 查询最近判定 |
+| `PUT` | `/v1/freezes` | 登记变更冻结 |
+| `GET` | `/v1/freezes` | 按状态和区域分页查询冻结 |
+| `GET` | `/v1/freezes/{id}` | 查询冻结 |
+| `PATCH` | `/v1/freezes/{id}` | 更新冻结（需要 `expected_version`） |
+| `PATCH` | `/v1/freezes/{id}/revoke` | 撤销冻结（不可追溯） |
+| `GET` | `/v1/freeze-blocks` | 查询冻结拦截记录 |
 
 ## 状态及失败行为
 
@@ -188,6 +215,8 @@ curl -sS -X PATCH http://127.0.0.1:8090/v1/plans/<plan_id>/assessments \
 - 一个节点同一时刻最多有一个 `claimed` 租约。
 - 相同请求键和相同内容可安全重放；同键异载荷返回 `idempotency_conflict`。
 - 一致性判定综合节点覆盖率、序列号、成功比例和最大延迟，返回 `consistent` 或 `review_required`。
+- 区域变更冻结按区域和范围在追加修订、激活、分配三个入口统一拦截，返回相同的 `change_frozen` 解释；例外角色通过 `X-Operator-Roles` 穿透。
+- 冻结边界按 UTC 绝对时刻做左闭右开比较，支持任意时区偏移；重叠冻结合取生效；冻结前在途流程按规则继续，撤销不抹除已发生的拦截。
 - 所有校验和冲突在快照替换前返回，不留下部分状态。
 
 ## 后续工程任务的行为边界
@@ -216,6 +245,7 @@ go run ./cmd/workflowprobe plan-revision-lifecycle
 go run ./cmd/workflowprobe node-lease-allocation
 go run ./cmd/workflowprobe probe-ingestion
 go run ./cmd/workflowprobe consistency-assessment
+go run ./cmd/workflowprobe change-freeze-enforcement
 ```
 
 探针不访问外部网络，也不依赖已有状态文件。

@@ -154,6 +154,8 @@ type State struct {
 	Assessments           map[string]RolloutAssessment `json:"assessments"`
 	LeaseRequestKeys      map[string]string            `json:"lease_request_keys"`
 	AssessmentRequestKeys map[string]string            `json:"assessment_request_keys"`
+	Freezes               map[string]ChangeFreeze      `json:"freezes"`
+	FreezeBlocks          map[string]FreezeBlock       `json:"freeze_blocks"`
 	AuditEvents           []AuditEvent                 `json:"audit_events"`
 }
 

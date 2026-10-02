@@ -82,6 +82,28 @@ Zone Rollout Control 是面向 DNS 运维人员的 Go HTTP 控制面。它把区
 - `probe_count`、`success_count`、`success_ratio`、`maximum_latency_ms`。
 - `created_at`。
 
+### ChangeFreeze
+
+重大活动期间按区域登记的变更冻结策略。
+
+- `id`：服务生成的稳定标识。
+- `zone`：冻结区域；空字符串表示对所有区域生效的全局冻结。
+- `scopes`：冻结范围，取值为 `revision`（追加修订）、`activation`（激活计划）、`allocation`（分配租约），至少一个。
+- `starts_at`、`ends_at`：RFC3339 边界时间；`ends_at` 缺省表示无结束时间。生效区间为左闭右开 `[starts_at, ends_at)`。
+- `reason`：冻结原因。
+- `allowed_roles`：允许穿透冻结的例外角色，大小写不敏感、精确匹配。
+- `status`：`scheduled`、`active`、`expired`、`revoked`，由服务按当前时间推导（撤销为终态）。
+- `version`：乐观并发版本，每次更新或撤销递增。
+- `created_by`、`created_at`、`updated_at`、`revoked_at`、`revoked_by`、`revocation_note`。
+
+### FreezeBlock
+
+冻结策略对一次入口调用的不可变拦截记录。
+
+- `id`、`freeze_id`、`zone`、`scope`、`plan_id`、`actor_role`。
+- `occurred_at`：拦截发生时间；`reason`：拦截时冻结登记的原因快照。
+- 冻结过期或撤销后记录仍然保留且可查询；撤销策略不会追溯抹除已发生的拦截。
+
 ## 4. 状态和规则
 
 ### 滚动计划状态
@@ -116,6 +138,22 @@ ready --lease--> leased --report--> ready
 - 条目数量范围为 1 到 500。
 - 区域名称、所有者名称和规范名称必须规范化为小写并移除末尾句点。
 - 重复加入完全相同的版本内容返回 `duplicate_revision`。
+
+### 区域变更冻结
+
+冻结只在区域和范围同时匹配时生效；未配置任何冻结策略的区域保持既有行为。
+
+- 冻结生效区间为左闭右开 `[starts_at, ends_at)`：开始瞬间即冻结，结束瞬间自动放行；所有比较基于归一化后的 UTC 绝对时刻，因此使用任何时区偏移登记的边界都得到稳定、唯一的解释。
+- 调用方角色通过 `X-Operator-Roles` 请求头传入（逗号分隔、大小写不敏感）；命中冻结的 `allowed_roles` 时穿透。
+- 三个入口在被拦截时返回同一个稳定错误：HTTP `423 Locked`、错误码 `change_frozen`，详情包含 `freeze_id`、`freeze_reason`、`freeze_starts_at`、`freeze_ends_at`、`allowed_roles`、`matching_freeze_ids`、`zone`、`scope`、`plan_id` 和 `actor_roles`。
+- 拦截与拒绝在同一个存储事务内完成：被拦截的变更不生效，但会写入一条不可变 `FreezeBlock` 和审计事件。
+- 冻结生效前已经合法开始的流程：
+  - 追加修订：计划创建时间早于冻结开始的草稿可以继续追加修订；冻结开始后才创建的计划全程受冻结约束。
+  - 分配租约：计划激活时间早于冻结开始的在途上线可以继续分配节点，以便完成上线；冻结开始后激活的计划不能分配。探针提交、租约释放等在途收尾操作不受冻结限制。
+  - 激活：激活是上线接触生产区域的起点，任何计划在冻结生效期间都不能激活，不因计划年龄而豁免。
+- 重叠冻结按合取组合：只有每个匹配冻结都豁免调用（角色例外或在途豁免）时才放行；错误详情中的 `freeze_id` 取最早开始的冻结，`matching_freeze_ids` 列出全部命中冻结。
+- 冻结更新和撤销需要匹配 `expected_version`；已撤销的冻结不能再更新。撤销仅对未来生效，不删除任何拦截记录。
+- 租约分配的幂等重放（相同 `request_key` 和相同载荷）在冻结生效后仍返回原分配组，重放不是新分配。
 
 ### 探针幂等
 
@@ -212,6 +250,28 @@ ready --lease--> leased --report--> ready
 
 失败行为：缺少区域版本、没有探针、请求键冲突或保存失败不会更新计划摘要。
 
+### W5 区域变更冻结
+
+入口：
+
+- `PUT /v1/freezes`
+- `GET /v1/freezes`、`GET /v1/freezes/{id}`
+- `PATCH /v1/freezes/{id}`
+- `PATCH /v1/freezes/{id}/revoke`
+- `GET /v1/freeze-blocks`
+- 复用 W1 的修订、激活入口和 W2 的分配入口。
+
+步骤：
+
+1. HTTP 层严格解码冻结登记、更新和撤销请求，校验区域、范围、RFC3339 时间边界、原因长度和角色名。
+2. 冻结服务在锁内登记冻结，保存乐观并发版本，更新和撤销校验版本。
+3. 修订、激活和分配服务在各自写事务内调用冻结守卫；守卫收集当前所有冻结并按区域、范围、角色和在途规则做纯判定。
+4. 命中冻结时，守卫在同一事务写入不可变拦截记录和审计事件，入口放弃业务变更但提交拦截记录，并返回统一的 `change_frozen` 解释。
+
+成功行为：例外角色穿透；冻结前已开始的草稿修订和在途计划分配按规则继续；未配置策略的区域行为不变。
+
+失败行为：被拦截的业务变更不落库；过期或被撤销的冻结不再拦截，但历史拦截记录保留。
+
 ## 6. 模块边界
 
 | 模块 | 路径 | 责任 |
@@ -223,6 +283,7 @@ ready --lease--> leased --report--> ready
 | allocation | `internal/allocation` | 节点筛选、幂等分配组和租约生命周期 |
 | probe | `internal/probe` | 探针校验、幂等写入和租约完成 |
 | assessment | `internal/assessment` | 探针聚合和一致性判定 |
+| freeze | `internal/freeze` | 冻结登记、撤销、纯冻结判定和事务内拦截守卫 |
 | domain | `internal/domain` | 聚合、值校验、状态迁移和纯计算 |
 | store | `internal/store` | 锁内副本事务和原子 JSON 持久化 |
 | platform | `internal/platform` | 时钟、标识、游标和文件锁 |
@@ -260,6 +321,12 @@ ready --lease--> leased --report--> ready
 - `PATCH /v1/leases/{id}/probes`
 - `PATCH /v1/plans/{id}/assessments`
 - `GET /v1/plans/{id}/assessments/latest`
+- `PUT /v1/freezes`
+- `GET /v1/freezes`
+- `GET /v1/freezes/{id}`
+- `PATCH /v1/freezes/{id}`
+- `PATCH /v1/freezes/{id}/revoke`
+- `GET /v1/freeze-blocks`
 
 ## 8. 工程机制
 
@@ -282,5 +349,6 @@ ready --lease--> leased --report--> ready
 2. 节点分配、租约唯一性、幂等重放和无可用节点冲突。
 3. 探针首写、同键重放、同键异载荷冲突和释放冲突。
 4. 一致性通过、审核触发、最新结果查询和幂等重放。
+5. 冻结登记与状态推导、三入口统一拦截、例外角色穿透、在途豁免、重叠冻结、跨时区边界、撤销不可追溯和并发版本冲突。
 
 每条探针使用独立临时目录，不访问外部网络，结束后关闭服务。

@@ -15,6 +15,7 @@ import (
 	"solo-0014-zone-rollout-control/internal/allocation"
 	"solo-0014-zone-rollout-control/internal/assessment"
 	"solo-0014-zone-rollout-control/internal/fleet"
+	"solo-0014-zone-rollout-control/internal/freeze"
 	"solo-0014-zone-rollout-control/internal/httpapi"
 	"solo-0014-zone-rollout-control/internal/plan"
 	"solo-0014-zone-rollout-control/internal/platform"
@@ -56,12 +57,14 @@ func run() error {
 	}
 	clock := platform.SystemClock{}
 	ids := platform.CryptoIDGenerator{}
-	plans := plan.New(stateStore, clock, ids)
+	guard := freeze.NewGuard(ids, clock)
+	plans := plan.New(stateStore, clock, ids, guard)
 	nodes := fleet.New(stateStore, clock, ids)
-	allocations := allocation.New(stateStore, clock, ids)
+	allocations := allocation.New(stateStore, clock, ids, guard)
 	probes := probe.New(stateStore, clock, ids, allocations)
 	assessments := assessment.New(stateStore, clock, ids)
-	api := httpapi.New(plans, nodes, allocations, probes, assessments, ids, logger)
+	freezes := freeze.New(stateStore, clock, ids)
+	api := httpapi.New(plans, nodes, allocations, probes, assessments, freezes, ids, logger)
 
 	server := &http.Server{
 		Addr:              address,
